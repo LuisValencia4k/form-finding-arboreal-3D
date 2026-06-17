@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20706928.svg)](https://doi.org/10.5281/zenodo.20706928)
 # Form-Finding Arboreal 3D
 
 Motor de form-finding funicular para estructuras arbóreas 3D con n ramas. Optimiza geometría vía FEM de vigas Timoshenko y Relajación Angular Dinámica, con análisis espectral, verificación MCFT y dimensionamiento estructural.
