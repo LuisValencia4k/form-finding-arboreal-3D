@@ -12,7 +12,6 @@ Este proyecto implementa un motor avanzado de búsqueda de formas (form-finding)
 - **Form-Finding Funicular**: Optimización de geometría basada en principios de cables y estructuras en tracción
 - **FEM de Vigas Timoshenko**: Análisis mediante método de elementos finitos considerando cortante
 - **Relajación Angular Dinámica**: Algoritmo iterativo para convergencia de geometría
-- **Análisis Espectral**: Evaluación de modos de vibración y propiedades dinámicas
 - **Verificación MCFT**: Validación mediante Teoría de Campo de Compresión Modificada
 - **Dimensionamiento Estructural**: Cálculo automático de secciones transversales óptimas
 
@@ -73,9 +72,6 @@ structure.plot()
 - Ajuste iterativo de ángulos nodales
 - Convergencia controlada por tolerancia
 
-### Análisis Espectral
-- Cálculo de valores y vectores propios
-- Análisis de frecuencias naturales
 
 ### Verificación MCFT
 - Validación de resistencia mediante teoría de campo de compresión
