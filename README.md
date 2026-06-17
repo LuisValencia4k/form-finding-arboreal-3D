@@ -21,9 +21,7 @@ Este proyecto implementa un motor avanzado de búsqueda de formas (form-finding)
 - Python 3.8+
 - Dependencias (ver `requirements.txt`):
   - NumPy
-  - SciPy
   - Matplotlib (para visualización)
-  - [Otras dependencias según corresponda]
 
 ## 🚀 Instalación
 
