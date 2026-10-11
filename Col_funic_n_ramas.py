@@ -26,6 +26,44 @@ Características principales:
 - Análisis espectral (kappa) para evaluación de convergencia y estabilidad.
 - Verificación estructural automatizada según MCFT (Modified Compression Field Theory).
 - Post-proceso morfológico para dimensionamiento de fuste y ramas ahusadas.
+
+REGISTRO DE CORRECCIONES (revisión de octubre 2026). Cada cambio está marcado
+en el código con un comentario "# [FIX - N]":
+  [FIX - 1]  history_alphas guardaba siempre la misma lista inicial: la trayectoria
+           dibujada en las topografías era un punto fijo. Ahora guarda los ángulos
+           reales de cada iteración y se poda en el rollback.
+  [FIX - 2]  Tras el rollback (y al agotar max_iter) la geometría se restauraba pero
+           u_global seguía siendo el de la última iteración (otra geometría). Todo
+           el post-proceso (energía, dimensionamiento) mezclaba geometría óptima con
+           desplazamientos de otra configuración. Ahora se re-ensambla y re-resuelve.
+  [FIX - 3]  El mensaje de early stopping decía "estancamiento" también cuando la causa
+           era divergencia o NaN. Ahora reporta la causa real.
+  [FIX - 4]  get_hiper_reactions dividía entre 1000 fuerzas que ya están en kN: V y M
+           del Experimento A/B se imprimían en MN y MN·m etiquetados como kN y kN·m.
+  [FIX - 5]  Unidades de energía: las cargas están en kN y E en Pa, por lo que
+           U_num = U[J]·1e-6. La energía se imprimía un millón de veces menor.
+  [FIX - 6]  Fuste: M_u se tomaba como V_tope·L (voladizo) y el reporte decía siempre
+           "Gobierna: Flexocompresión & Geometría". Ahora M_u = máx. momento de
+           extremo del FEM, se reporta la excentricidad relativa ê = M/(P·D) y el
+           criterio que realmente gobierna.
+  [FIX - 7]  Clipping: Z_min se leía de self.nodes[1] (índice fijo). Ahora se usa el
+           nodo de capitel registrado y se impone una holgura mínima para que el
+           enlace rígido no tenga longitud cero (K indefinida). add_element rechaza
+           elementos de longitud nula.
+  [FIX - 8]  Diagnóstico KKT: RAD se detiene con ramas sobre la cota geométrica
+           (arranque a la altura del capitel). La norma de J^T G en ese punto no
+           mide estacionariedad; se reporta el gradiente proyectado y las cotas
+           activas.
+  [FIX - 9]  Pandeo de Euler: se combinaba la P_u máxima de una rama con la L máxima
+           de otra. Ahora se verifica rama por rama (D_base = máximo requerido).
+  [FIX - 10] Nuevo refinamiento Gauss-Newton/Levenberg-Marquardt proyectado
+           (refinar_gauss_newton) para ir del punto fijo de RAD al mínimo restringido
+           de Phi. Sirve para separar la limitación del algoritmo de la del problema.
+  [FIX - 11] La prueba de descenso dejaba el solver sin re-resolver tras restaurar la
+           geometría, y podía probar ángulos fuera de las cotas de clipping.
+  [FIX - 12] Las topografías 2D barrían ángulos no admisibles (arranque bajo el capitel)
+           y marcaban como "mínimo teórico" puntos fuera del dominio. Se dibuja la cota
+           y el mínimo se busca sólo en la región admisible.
 ===============================================================================
 """
 
@@ -51,8 +89,12 @@ class FormFindingFEM:
         self.history_Gvec = []
         self.history_Vcol = []
         self.history_alphas = []
-        self.initial_node_coords = None   
-        self.default_ks = 5.0/6.0   
+        self.initial_node_coords = None
+        self.default_ks = 5.0/6.0
+        # [FIX - 7] Nodo de capitel (cota inferior del arranque de las ramas) y holgura
+        # mínima del enlace rígido. Se asignan en build_arboreal_structure_general.
+        self.capitel_node = 1
+        self.min_link_gap = 0.05
 
     # --------------------------------------------------------------
     # 1. MALLADO Y CONDICIONES DE BORDE
@@ -80,6 +122,9 @@ class FormFindingFEM:
         xj, yj, zj = self.nodes[j]['x'], self.nodes[j]['y'], self.nodes[j]['z']
         dx, dy, dz = xj - xi, yj - yi, zj - zi
         L = math.sqrt(dx*dx + dy*dy + dz*dz)
+        # [FIX - 7] Un elemento de longitud nula deja K indefinida (división entre L).
+        if L < 1e-9:
+            raise ValueError(f"Elemento {i}-{j} de longitud nula: K no está definida.")
 
         if is_branch:
             if top_node is None:
@@ -276,8 +321,11 @@ class FormFindingFEM:
         self.history_Gvec = []      
         self.history_Vcol = [] 
         self.history_alphas = []
-        current_alphas = [e['branch_params']['alpha_rad'] for e in self.elements if e.get('is_branch', False)]
-        self.history_alphas.append(current_alphas)     
+        # [FIX - 1] Antes se guardaba esta lista una vez y se volvía a añadir el MISMO
+        # objeto en cada iteración, sin actualizarlo nunca. Ahora history_alphas[k]
+        # son los ángulos con los que se resolvió la iteración k.
+        self.converged = False
+        stop_reason = None
 
         # --- VARIABLES PARA EL ROLLBACK (INICIALIZADAS FUERA DEL BUCLE) ---
         best_Tres = float('inf')
@@ -308,7 +356,8 @@ class FormFindingFEM:
             self.history_Tres.append(T_res)
             self.history_Gvec.append(G_vec.copy())
             self.history_Vcol.append(V_col)
-            self.history_alphas.append(current_alphas)
+            # [FIX - 1] ángulos reales de esta iteración (copia nueva en cada paso)
+            self.history_alphas.append(self._alphas_actuales())
             
             # --- LÓGICA DE EARLY STOPPING Y ROLLBACK ---
             if T_res < best_Tres:
@@ -321,29 +370,17 @@ class FormFindingFEM:
                 patience_counter += 1
                 
             # Criterio de parada: estancamiento o divergencia
-            if patience_counter > patience or math.isnan(T_res) or T_res > best_Tres * 100:
+            # [FIX - 3] Se distingue la causa real de la parada.
+            if math.isnan(T_res):
+                stop_reason = "NaN en el residuo"
+            elif T_res > best_Tres * 100:
+                stop_reason = "divergencia (T_res > 100·mínimo histórico)"
+            elif patience_counter > patience:
+                stop_reason = f"estancamiento ({patience} iteraciones sin mejora)"
+            if stop_reason is not None:
                 if verbose:
-                    print(f"\n[Early Stopping] Estancamiento detectado tras {patience} iteraciones sin mejora.")
+                    print(f"\n[Early Stopping] Causa: {stop_reason}.")
                     print(f"[Rollback] Restaurando mínimo histórico (iter {best_iter}, T_res = {best_Tres:.4f} kN)")
-                
-                # Restaurar geometría óptima
-                for idx, n in enumerate(self.nodes):
-                    n['x'] = best_nodes[idx]['x']
-                    n['y'] = best_nodes[idx]['y']
-                    n['z'] = best_nodes[idx]['z']
-                
-                b_idx = 0
-                for e in self.elements:
-                    if e.get('is_branch', False):
-                        bp = e['branch_params']
-                        bp['alpha_rad'] = best_branches[b_idx]
-                        bp['alpha_deg'] = math.degrees(best_branches[b_idx])
-                        b_idx += 1
-                        
-                # Podar historiales para que las gráficas usen el punto óptimo
-                self.history_Tres = self.history_Tres[:best_iter+1]
-                self.history_Gvec = self.history_Gvec[:best_iter+1]
-                self.history_Vcol = self.history_Vcol[:best_iter+1]
                 break
 
             # --- REPORTE DETALLADO ---
@@ -387,9 +424,11 @@ class FormFindingFEM:
                     alpha_new_teorico = alpha_old + w_i * (theta_F - alpha_old)
                     
                     # Clipping geométrico
+                    # [FIX - 7] Cota inferior desde el nodo de capitel registrado (antes
+                    # self.nodes[1] fijo) más una holgura que evita un enlace rígido de
+                    # longitud cero cuando el arranque está en la vertical del fuste.
                     Z_sup = self.nodes[bp['node_sup']]['z']
-                    Z_min = self.nodes[1]['z'] 
-                    Z_max = Z_sup - 0.05 
+                    Z_min, Z_max = self._cotas_z(bp)
                     
                     # Cálculo de la nueva posición z de la rama hija y actualización del ángulo real basado en el desplazamiento permitido
                     Z_teorico = Z_sup - bp['L_xy'] * math.tan(alpha_new_teorico)
@@ -401,7 +440,125 @@ class FormFindingFEM:
                     bp['alpha_rad'] = alpha_real_rad
                     bp['alpha_deg'] = math.degrees(alpha_real_rad)
 
+        # [FIX - 2] Restaurar SIEMPRE la mejor geometría (también si se agotó max_iter,
+        # caso en que la geometría actual ya fue modificada tras la última solución) y
+        # volver a resolver, para que u_global corresponda a esa geometría. Antes el
+        # rollback restauraba nodos pero dejaba u_global de la última iteración, y el
+        # post-proceso (energía, dimensionamiento) operaba con estados mezclados.
+        if not self.converged:
+            for idx, n in enumerate(self.nodes):
+                n['x'] = best_nodes[idx]['x']
+                n['y'] = best_nodes[idx]['y']
+                n['z'] = best_nodes[idx]['z']
+            b_idx = 0
+            for e in self.elements:
+                if e.get('is_branch', False):
+                    bp = e['branch_params']
+                    bp['alpha_rad'] = best_branches[b_idx]
+                    bp['alpha_deg'] = math.degrees(best_branches[b_idx])
+                    b_idx += 1
+            # Podar historiales para que las gráficas terminen en el punto óptimo
+            self.history_Tres = self.history_Tres[:best_iter+1]
+            self.history_Gvec = self.history_Gvec[:best_iter+1]
+            self.history_Vcol = self.history_Vcol[:best_iter+1]
+            self.history_alphas = self.history_alphas[:best_iter+1]   # [FIX - 1]
+        self.ensamblar_sistema_global()
+        self.resolver()
+        self.stop_reason = stop_reason if stop_reason else ("convergencia" if self.converged else "max_iter")
+
         return self.history_Tres, self.history_Gvec, self.history_Vcol
+
+    # --------------------------------------------------------------
+    # UTILIDADES DE ESTADO ANGULAR  [FIX-1, FIX-7, FIX-8, FIX-10]
+    # --------------------------------------------------------------
+    def _ramas(self):
+        return [e for e in self.elements if e.get('is_branch', False)]
+
+    def _alphas_actuales(self):
+        return [e['branch_params']['alpha_rad'] for e in self._ramas()]
+
+    def _cotas_z(self, bp):
+        """[FIX - 7] Cotas de la coordenada z del arranque de una rama.
+        Inferior: altura del capitel; si el arranque queda en la vertical del capitel
+        (distancia horizontal < min_link_gap) se exige una holgura vertical para que
+        el enlace rígido no degenere en longitud cero. Superior: 5 cm bajo el tope."""
+        z_cap = self.nodes[self.capitel_node]['z']
+        ni = self.nodes[bp['node_inf']]; nc = self.nodes[self.capitel_node]
+        d_h = math.hypot(ni['x'] - nc['x'], ni['y'] - nc['y'])
+        Z_min = z_cap + (self.min_link_gap if d_h < self.min_link_gap else 0.0)
+        Z_max = self.nodes[bp['node_sup']]['z'] - 0.05
+        return Z_min, Z_max
+
+    def cotas_alpha(self):
+        """[FIX - 8] Intervalo admisible de cada ángulo impuesto por el clipping."""
+        lo, hi = [], []
+        for e in self._ramas():
+            bp = e['branch_params']
+            Z_sup = self.nodes[bp['node_sup']]['z']
+            Z_min, Z_max = self._cotas_z(bp)
+            hi.append(math.atan2(Z_sup - Z_min, bp['L_xy']))
+            lo.append(math.atan2(Z_sup - Z_max, bp['L_xy']))
+        return np.array(lo), np.array(hi)
+
+    def aplicar_alphas(self, alphas, resolver=True):
+        """Fija los ángulos (rad), mueve los arranques y, si se pide, resuelve."""
+        for e, a in zip(self._ramas(), alphas):
+            bp = e['branch_params']
+            bp['alpha_rad'] = float(a)
+            bp['alpha_deg'] = math.degrees(a)
+            self.nodes[bp['node_inf']]['z'] = self.nodes[bp['node_sup']]['z'] - bp['L_xy'] * math.tan(a)
+        if resolver:
+            self.ensamblar_sistema_global()
+            self.resolver()
+            return self.compute_T_res_vec()
+        return None
+
+    def gradiente_proyectado(self, grad, tol_deg=1e-3):
+        """[FIX - 8] Gradiente de Phi proyectado sobre las cotas activas.
+        En una cota superior activa, la componente que empuja hacia afuera
+        (grad < 0, es decir, Phi bajaría aumentando alpha) no indica falta de
+        estacionariedad: es la condición KKT. Igual en la cota inferior."""
+        lo, hi = self.cotas_alpha()
+        a = np.array(self._alphas_actuales())
+        tol = math.radians(tol_deg)
+        en_hi = np.abs(a - hi) < tol
+        en_lo = np.abs(a - lo) < tol
+        gp = np.array(grad, dtype=float).copy()
+        gp[en_hi & (gp < 0)] = 0.0
+        gp[en_lo & (gp > 0)] = 0.0
+        return gp, en_lo, en_hi
+
+    def refinar_gauss_newton(self, max_iter=200, tol=1e-6, mu0=1e-3, delta=1e-6, verbose=True):
+        """[FIX - 10] Levenberg-Marquardt proyectado sobre las cotas de clipping.
+        Paso: (J^T J + mu·I) d = -J^T G, recortado a [lo, hi]. Usa la curvatura de
+        Gauss-Newton (J^T J), que RAD no usa. Devuelve (T_res_final, iteraciones)."""
+        lo, hi = self.cotas_alpha()
+        a = np.clip(np.array(self._alphas_actuales()), lo, hi)
+        G = self.aplicar_alphas(a)
+        T = float(np.linalg.norm(G)); mu = mu0
+        for k in range(max_iter):
+            J, G, grad, _ = compute_jacobian_alpha(self, delta=delta)
+            gp, _, _ = self.gradiente_proyectado(grad)
+            if T < tol or np.linalg.norm(gp) < tol:
+                break
+            mejora = False
+            for _ in range(30):
+                d = np.linalg.solve(J.T @ J + mu * np.eye(len(a)), -grad)
+                a_new = np.clip(a + d, lo, hi)
+                G_new = self.aplicar_alphas(a_new)
+                T_new = float(np.linalg.norm(G_new))
+                if T_new < T:
+                    a, T, mejora = a_new, T_new, True
+                    mu = max(mu / 3.0, 1e-12)
+                    break
+                mu *= 4.0
+            if not mejora:
+                self.aplicar_alphas(a)
+                break
+        self.aplicar_alphas(a)
+        if verbose:
+            print(f"[Gauss-Newton proyectado] T_res = {T:.6f} kN tras {k+1} iteraciones")
+        return T, k + 1
 
     # --------------------------------------------------------------
     # POST-PROCESO: VERIFICACIÓN MCFT, ENERGÍA, MORFOLOGÍA
@@ -452,17 +609,21 @@ class FormFindingFEM:
         U_total = U_axial + U_flex
         if U_total == 0:
             return
+        # [FIX - 5] Cargas en kN con E en Pa: u_num = u_real/1000 y f en kN, de modo que
+        # 0.5·f·u_num = U[J]·1e-6. Se convierte a joules antes de imprimir. El índice
+        # funicular (cociente) no cambia.
+        U_total_J = U_total * 1e6
         
         # Cálculo de porcentajes y clasificación
         pct_axial = (U_axial / U_total) * 100
         pct_flex = (U_flex / U_total) * 100
         indice = U_axial / U_total
-        if U_total < 1e-3:
-            energia_str = f"{U_total * 1e6:.2f} µJ"
-        elif U_total < 1.0:
-            energia_str = f"{U_total * 1000:.2f} mJ"
+        if U_total_J < 1e-3:
+            energia_str = f"{U_total_J * 1e6:.2f} µJ"
+        elif U_total_J < 1.0:
+            energia_str = f"{U_total_J * 1000:.2f} mJ"
         else:
-            energia_str = f"{U_total:.2f} J"
+            energia_str = f"{U_total_J:.2f} J"
         clasif = ("ESTRUCTURA FUNICULAR" if indice >= 0.95 else
                   "CUASI FUNICULAR" if indice >= 0.85 else
                   "SISTEMA HÍBRIDO (FLEXO-COMPRESIÓN)" if indice >= 0.60 else
@@ -471,13 +632,14 @@ class FormFindingFEM:
         print("            DIAGNÓSTICO FUNICULAR               ")
         print("================================================")
         print(f"T_res global remanente = {self.history_Tres[-1]:.2f} kN")
-        print(f"Energía de deformación = {energia_str} (Bruto: {U_total:.4e} J)")
+        print(f"Energía de deformación = {energia_str} (Bruto: {U_total_J:.4e} J)")
         print("------------------------------------------------")
         print(f"Energía axial          = {pct_axial:.1f} %")
         print(f"Energía flexión/corte  = {pct_flex:.1f} %")
         print(f"\nÍndice funicular       = {indice:.3f}")
         print(f"\nClasificación: [{pct_axial:.1f}%] {clasif}")
         print("================================================")
+        return indice
 
     def optimizar_dimensiones_circulares(self, f_c_MPa=30.0, h_losa_m=0.25, E_concreto_Pa=30e9):
         print("\n================================================")
@@ -500,44 +662,67 @@ class FormFindingFEM:
                 break
             d_hija_tope += step
         D_hija_base = d_hija_tope
-        Pu_rama_max = 0.0
-        L_rama_max = 0.0
+        # [FIX - 9] Antes se combinaba la P_u máxima de una rama con la L máxima de otra
+        # (par que puede no existir). Ahora cada rama se verifica con su propia P_u y L,
+        # y D_base es el mayor diámetro requerido. P_u = |F| total en el arranque
+        # (conservador: incluye la pequeña componente ortogonal).
+        D_hija_base = d_hija_tope
         for e in self.elements:
             if e.get('is_branch', False):
                 f_glob = self.obtener_fuerzas_nodales_elemento(e)
-                F_axial = np.linalg.norm(f_glob[0:3])
-                Pu_rama_max = max(Pu_rama_max, F_axial)
-                L_rama_max = max(L_rama_max, e['L'])
-        Pu_rama_N = Pu_rama_max * 1000.0
-        while True:
-            d_mid = (D_hija_base + d_hija_tope) / 2.0
-            I_avg = (math.pi * d_mid**4) / 64.0
-            P_cr = (math.pi**2 * E_concreto_Pa * I_avg) / (L_rama_max**2)
-            if 0.75 * P_cr >= Pu_rama_N:
-                break
-            D_hija_base += step
+                Pu_k_N = np.linalg.norm(f_glob[0:3]) * 1000.0
+                D_k = d_hija_tope
+                while True:
+                    d_mid = (D_k + d_hija_tope) / 2.0
+                    I_avg = (math.pi * d_mid**4) / 64.0
+                    P_cr = (math.pi**2 * E_concreto_Pa * I_avg) / (e['L']**2)
+                    if 0.75 * P_cr >= Pu_k_N:
+                        break
+                    D_k += step
+                D_hija_base = max(D_hija_base, D_k)
         D_padre = max(D_padre, D_hija_base)
         Pu_padre_N = 0.0
         Mu_padre_Nm = 0.0
+        V_fuste_kN = 0.0
         for e in self.elements:
             if e.get('is_trunk', False):
                 f_glob = self.obtener_fuerzas_nodales_elemento(e)
                 Pu_padre_N = abs(f_glob[2]) * 1000.0
-                V_hiper_N = math.sqrt(f_glob[6]**2 + f_glob[7]**2) * 1000.0
-                Mu_padre_Nm = V_hiper_N * e['L']
+                V_fuste_kN = math.sqrt(f_glob[6]**2 + f_glob[7]**2)
+                # [FIX - 6] Antes: M_u = V_tope·L (hipótesis de voladizo). Con capitel
+                # rígido y ramas apoyadas en la losa el fuste trabaja en doble curvatura;
+                # se toma el mayor momento de extremo que da el propio FEM.
+                M_base = math.hypot(f_glob[3], f_glob[4])
+                M_tope = math.hypot(f_glob[9], f_glob[10])
+                Mu_padre_Nm = max(M_base, M_tope) * 1000.0
                 break
+        D_flex = None
         while True:
             Area = (math.pi * D_padre**2) / 4.0
             S_modulo = (math.pi * D_padre**3) / 32.0
             esfuerzo_max = (Pu_padre_N / Area) + (Mu_padre_Nm / S_modulo)
             esfuerzo_resistente = phi_comp * 0.85 * f_c_Pa
-            cond_geom = D_padre >= (1.5 * D_hija_base)
-            if esfuerzo_max <= esfuerzo_resistente and cond_geom:
+            cond_resist = esfuerzo_max <= esfuerzo_resistente
+            cond_geom = D_padre >= (1.5 * D_hija_base) - 1e-12
+            if cond_resist and D_flex is None:
+                D_flex = D_padre
+            if cond_resist and cond_geom:
                 break
             D_padre += step
+        # [FIX - 6] Criterio que gobierna realmente y excentricidad relativa e = M/(P·D)
+        D_geom = 1.5 * D_hija_base
+        if D_flex is not None and D_flex >= D_geom - 1e-9:
+            gobierna = "Flexocompresión"
+        else:
+            gobierna = "Geometría (1.5·D_base)"
+        e_rel = (Mu_padre_Nm / (Pu_padre_N * D_padre)) if Pu_padre_N > 0 else float('nan')
+        self.dim_fuste = {'P_u_kN': Pu_padre_N/1000.0, 'M_u_kNm': Mu_padre_Nm/1000.0,
+                          'V_kN': V_fuste_kN, 'D_m': D_padre, 'e_rel': e_rel, 'gobierna': gobierna}
         print("         RESULTADOS DEL DIMENSIONAMIENTO        ")
         print("------------------------------------------------")
-        print(f"Fuste Padre (D)        : {D_padre*100:.1f} cm   [Gobierna: Flexocompresión & Geometría]")
+        print(f"Fuste Padre (D)        : {D_padre*100:.1f} cm   [Gobierna: {gobierna}]")
+        print(f"   P_u = {Pu_padre_N/1000:.1f} kN, V = {V_fuste_kN:.2f} kN, M_u(FEM) = {Mu_padre_Nm/1000:.2f} kN·m, ê = M/(P·D) = {e_rel:.3f}")
+        print(f"   (núcleo central de sección circular maciza: ê = 1/8 = 0.125; ACI exige P–M en todo caso)")
         print(f"Rama Hija Base (D_inf) : {D_hija_base*100:.1f} cm   [Gobierna: Pandeo de Euler]")
         print(f"Rama Hija Tope (d_sup) : {d_hija_tope*100:.1f} cm   [Gobierna: Punzonamiento Losa]")
         print(f"Ratio de ahusamiento de rama : {d_hija_tope/D_hija_base:.2f}")
@@ -652,10 +837,19 @@ class FormFindingFEM:
             
         plt.plot(math.degrees(a1_final), math.degrees(a2_final), 'r*', markersize=18, markeredgecolor='black', label='Óptimo Alcanzado')
         
-        min_idx = np.unravel_index(np.argmin(Z_Tres, axis=None), Z_Tres.shape)
+        # [FIX - 12] La malla barre ±margin_deg sin respetar el clipping: parte del mapa
+        # corresponde a arranques por debajo del capitel (no admisibles). Se dibujan las
+        # cotas y el "mínimo de la malla" se busca sólo en la región admisible.
+        lo_a, hi_a = self.cotas_alpha()
+        k1 = ramas.index(r1); k2 = ramas.index(r2)
+        admisible = (A1 <= hi_a[k1] + 1e-12) & (A2 <= hi_a[k2] + 1e-12) & (A1 >= lo_a[k1]) & (A2 >= lo_a[k2])
+        plt.axvline(math.degrees(hi_a[k1]), color='red', linestyle='-.', linewidth=1.2, label='Cota geométrica (arranque = capitel)')
+        plt.axhline(math.degrees(hi_a[k2]), color='red', linestyle='-.', linewidth=1.2)
+        Z_adm = np.where(admisible, Z_Tres, np.inf)
+        min_idx = np.unravel_index(np.argmin(Z_adm, axis=None), Z_adm.shape)
         a1_min = math.degrees(a1_vals[min_idx[1]])
         a2_min = math.degrees(a2_vals[min_idx[0]])
-        plt.plot(a1_min, a2_min, 'kX', markersize=12, label='Mínimo Teórico Local')
+        plt.plot(a1_min, a2_min, 'kX', markersize=12, label='Mínimo de la malla (admisible)')
         
         plt.xlabel(f'Ángulo $\\alpha_{{{node_sup_1}}}$ de la Rama {node_sup_1} (grados)')
         plt.ylabel(f'Ángulo $\\alpha_{{{node_sup_2}}}$ de la Rama {node_sup_2} (grados)')
@@ -704,7 +898,7 @@ class FormFindingFEM:
 def build_arboreal_structure_general(base_fix, branch_data_list, capitel_rigido=True):
     solver = FormFindingFEM()
     solver.add_node(0.0, 0.0, 0.0, fix=base_fix)
-    solver.add_node(0.0, 0.0, 1.5)
+    solver.capitel_node = solver.add_node(0.0, 0.0, 1.5)   # [FIX - 7] nodo de capitel explícito
     
     arranques = []
     tops = []
@@ -750,8 +944,10 @@ def get_hiper_reactions(solver):
             f_glob = solver.obtener_fuerzas_nodales_elemento(e)
             F_tope = f_glob[6:9]
             M_tope = f_glob[9:12]
-            V = np.sqrt(F_tope[0]**2 + F_tope[1]**2) / 1000.0
-            M = np.sqrt(M_tope[0]**2 + M_tope[1]**2) / 1000.0
+            # [FIX - 4] Las fuerzas del FEM ya están en kN (las cargas se dan en kN).
+            # Dividir entre 1000 reportaba MN y MN·m con etiqueta de kN y kN·m.
+            V = float(np.sqrt(F_tope[0]**2 + F_tope[1]**2))
+            M = float(np.sqrt(M_tope[0]**2 + M_tope[1]**2))
             return V, M
     return 0.0, 0.0
 
@@ -950,6 +1146,29 @@ if __name__ == "__main__":
             else:
                 print("  Jacobiano rango completo: Nul(J^T) = {0}, T_hiper = 0.")
 
+            # [FIX - 8] Condición KKT. RAD recorta el arranque a la altura del capitel; si
+            # una rama queda sobre esa cota, ||J^T G|| no tiene por qué anularse y no
+            # mide estacionariedad. Lo que debe anularse es el gradiente proyectado, y la
+            # descomposición T_geo/T_hiper debe hacerse con las columnas LIBRES de J.
+            gp, en_lo, en_hi = solver.gradiente_proyectado(grad)
+            libres = ~(en_lo | en_hi)
+            print(f"  Ramas sobre cota superior (arranque = capitel): {[int(i) for i in np.where(en_hi)[0]]}")
+            print(f"  Ramas sobre cota inferior: {[int(i) for i in np.where(en_lo)[0]]}")
+            print(f"  ||gradiente proyectado|| = {np.linalg.norm(gp):.6f} kN²/rad")
+            if libres.any():
+                Jf = J[:, libres]
+                Uf, Sf, _ = np.linalg.svd(Jf, full_matrices=True)
+                rf = int(np.sum(Sf > 1e-6 * Sf[0]))
+                if rf < 3:
+                    Nf = Uf[:, rf:]
+                    Th = Nf @ (Nf.T @ G0_vec)
+                    print(f"  J libre (3 x {int(libres.sum())}): rango {rf}, sigma = {Sf}")
+                    print(f"  ||T_hiper|| (con J libre) = {np.linalg.norm(Th):.6f} kN,  ||T_geo|| = {np.linalg.norm(G0_vec - Th):.6f} kN")
+                else:
+                    print(f"  J libre de rango 3: si el punto fuera estacionario, G = 0.")
+            else:
+                print("  Todas las ramas sobre cota: G queda fijado por la geometría admisible.")
+
         # ============================================================
         # PRUEBA DE DESCENSO CON UN PASO DE GRADIENTE
         # ============================================================
@@ -970,9 +1189,10 @@ if __name__ == "__main__":
             best_eta, best_T, best_red = None, float('inf'), 0.0
             for eta in [1e-5, 5e-6, 1e-6, 5e-7, 1e-7]:
                 delta_alpha = -eta * grad
+                lo_a, hi_a = solver.cotas_alpha()   # [FIX - 11] respetar las cotas de clipping
                 for i, e in enumerate(branch_elems):
                     bp      = e['branch_params']
-                    a_new   = alphas_orig[i] + delta_alpha[i]
+                    a_new   = float(np.clip(alphas_orig[i] + delta_alpha[i], lo_a[i], hi_a[i]))
                     bp['alpha_rad'] = a_new
                     bp['alpha_deg'] = math.degrees(a_new)
                     solver.nodes[bp['node_inf']]['z'] = (
@@ -992,6 +1212,9 @@ if __name__ == "__main__":
                 for i, e in enumerate(branch_elems):
                     e['branch_params']['alpha_rad'] = alphas_orig[i]
                     e['branch_params']['alpha_deg'] = math.degrees(alphas_orig[i])
+            # [FIX - 11] re-resolver: u_global quedaba del último η probado
+            solver.ensamblar_sistema_global()
+            solver.resolver()
         else:
             print("[Advertencia] No se puede ejecutar la prueba de descenso porque no se dispone del Jacobiano o del gradiente.")
             solver.ensamblar_sistema_global()
@@ -1004,4 +1227,30 @@ if __name__ == "__main__":
         else:
             print("✗ Ningún η redujo T_res. Revisar gradiente.")
         print("="*70)
+
+        # ============================================================
+        # [FIX - 10] REFINAMIENTO GAUSS-NEWTON PROYECTADO (opcional)
+        # Separa lo que es límite de RAD de lo que es límite del problema: si el
+        # refinamiento baja T_res, el valor de RAD no era el mínimo restringido.
+        # ============================================================
+        REFINAR_GN = True
+        if REFINAR_GN:
+            print("\n" + "="*70)
+            print("REFINAMIENTO GAUSS-NEWTON PROYECTADO DESDE EL PUNTO DE RAD")
+            print("="*70)
+            T_rad = float(np.linalg.norm(solver.compute_T_res_vec()))
+            alphas_rad = solver._alphas_actuales()
+            T_gn, it_gn = solver.refinar_gauss_newton(max_iter=2000, verbose=False)
+            print(f"  T_res RAD = {T_rad:.4f} kN  ->  T_res GN = {T_gn:.4f} kN  ({it_gn} iteraciones)")
+            J_gn, G_gn, g_gn, _ = compute_jacobian_alpha(solver, delta=1e-4)
+            gp_gn, _, hi_gn = solver.gradiente_proyectado(g_gn)
+            for e in solver._ramas():
+                bp = e['branch_params']
+                print(f"  Rama {bp['node_sup']}: α = {bp['alpha_deg']:.2f}°")
+            print(f"  Ramas sobre cota en el mínimo restringido: {[int(i) for i in np.where(hi_gn)[0]]}")
+            print(f"  ||gradiente proyectado|| = {np.linalg.norm(gp_gn):.4f} kN²/rad")
+            # Las topografías se dibujan alrededor del punto de RAD (el que se estudia).
+            solver.aplicar_alphas(alphas_rad)
+            print("="*70)
+
         solver.generate_all_plots(resolution=20, margin_deg=10.0)
