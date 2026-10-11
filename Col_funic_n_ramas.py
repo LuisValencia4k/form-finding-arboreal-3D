@@ -1004,5 +1004,4 @@ if __name__ == "__main__":
         else:
             print("✗ Ningún η redujo T_res. Revisar gradiente.")
         print("="*70)
-
         solver.generate_all_plots(resolution=20, margin_deg=10.0)
